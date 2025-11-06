@@ -4,6 +4,7 @@ import logging
 import os
 import uuid
 from datetime import datetime
+from typing import Optional
 from openai import AzureOpenAI
 from azure.monitor.opentelemetry import configure_azure_monitor
 from opentelemetry import trace
@@ -25,7 +26,7 @@ tracer = trace.get_tracer(__name__)
 app = func.FunctionApp(http_auth_level=func.AuthLevel.ANONYMOUS)
 
 
-def log_evaluation(response_id: str, evaluator_name: str, score: float, comments: str = ""):
+def log_evaluation(response_id: str, evaluator_name: str, score: float, comments: str = "", reasoning: str = ""):
     """
     Log an evaluation metric for a response following AI Foundry conventions
     """
@@ -35,27 +36,161 @@ def log_evaluation(response_id: str, evaluator_name: str, score: float, comments
         span.set_attribute("gen_ai.evaluator.name", evaluator_name)
         span.set_attribute("gen_ai.response.id", response_id)
 
+        # Store reasoning in the evaluation span
+        if reasoning:
+            span.set_attribute("evaluation.reasoning", reasoning)
+
         if comments:
             logging.info(f"Evaluation {evaluator_name}: {score} - {comments}")
         else:
             logging.info(f"Evaluation {evaluator_name}: {score}")
 
 
-def evaluate_response(response_id: str, response_text: str, user_query: str):
+def evaluate_with_llm(client, deployment_name: str, response_id: str,
+                       response_text: str, user_query: str, criterion: str,
+                       context: str = "") -> tuple[float, str]:
     """
-    Run multiple evaluations on the AI response
+    Use an LLM as a judge to evaluate the response on a specific criterion
+    Returns: (score, reasoning)
     """
-    # Relevance evaluation (mock scoring)
-    relevance_score = 0.9 if "weather" in user_query.lower() else 0.7
-    log_evaluation(response_id, "relevance", relevance_score, "Response addresses the user's query")
+    evaluation_prompts = {
+        "relevance": f"""You are an expert evaluator. Assess how relevant the AI response is to the user's query.
 
-    # Coherence evaluation (mock scoring based on response length)
-    coherence_score = 0.85 if len(response_text) > 50 else 0.6
-    log_evaluation(response_id, "coherence", coherence_score, "Response is well-structured")
+User Query: {user_query}
+AI Response: {response_text}
 
-    # Groundedness evaluation (mock scoring - assumes weather data is grounded)
-    groundedness_score = 0.95
-    log_evaluation(response_id, "groundedness", groundedness_score, "Response is based on retrieved data")
+Rate the relevance on a scale of 0.0 to 1.0 where:
+- 1.0 = Perfectly addresses the query
+- 0.7 = Mostly relevant with minor issues
+- 0.5 = Partially relevant
+- 0.3 = Barely relevant
+- 0.0 = Completely irrelevant
+
+Respond in JSON format:
+{{"score": <float between 0.0 and 1.0>, "reasoning": "<brief explanation>"}}""",
+
+        "coherence": f"""You are an expert evaluator. Assess how coherent and well-structured the AI response is.
+
+AI Response: {response_text}
+
+Rate the coherence on a scale of 0.0 to 1.0 where:
+- 1.0 = Perfectly coherent, logical, and well-structured
+- 0.7 = Mostly coherent with minor issues
+- 0.5 = Somewhat coherent
+- 0.3 = Poorly structured or confusing
+- 0.0 = Incoherent
+
+Respond in JSON format:
+{{"score": <float between 0.0 and 1.0>, "reasoning": "<brief explanation>"}}""",
+
+        "groundedness": f"""You are an expert evaluator. Assess if the AI response is grounded in the provided context/data.
+
+Context/Retrieved Data: {context}
+AI Response: {response_text}
+
+Rate the groundedness on a scale of 0.0 to 1.0 where:
+- 1.0 = Completely grounded, no hallucinations
+- 0.7 = Mostly grounded with minor extrapolations
+- 0.5 = Partially grounded
+- 0.3 = Significant hallucinations
+- 0.0 = Completely ungrounded
+
+Respond in JSON format:
+{{"score": <float between 0.0 and 1.0>, "reasoning": "<brief explanation>"}}""",
+
+        "helpfulness": f"""You are an expert evaluator. Assess how helpful the AI response is to the user.
+
+User Query: {user_query}
+AI Response: {response_text}
+
+Rate the helpfulness on a scale of 0.0 to 1.0 where:
+- 1.0 = Extremely helpful, actionable information
+- 0.7 = Helpful with good information
+- 0.5 = Somewhat helpful
+- 0.3 = Minimally helpful
+- 0.0 = Not helpful at all
+
+Respond in JSON format:
+{{"score": <float between 0.0 and 1.0>, "reasoning": "<brief explanation>"}}"""
+    }
+
+    prompt = evaluation_prompts.get(criterion, evaluation_prompts["relevance"])
+
+    with tracer.start_as_current_span(f"llm_judge.{criterion}") as span:
+        span.set_attribute("gen_ai.evaluation.criterion", criterion)
+        span.set_attribute("gen_ai.response.id", response_id)
+
+        try:
+            judge_response = client.chat.completions.create(
+                model=deployment_name,
+                messages=[
+                    {"role": "system", "content": "You are a precise evaluator that returns scores in valid JSON format."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.0,  # Deterministic evaluation
+                max_tokens=300
+            )
+
+            result_text = judge_response.choices[0].message.content.strip()
+
+            # Track token usage for evaluation
+            if hasattr(judge_response, 'usage') and judge_response.usage:
+                span.set_attribute("gen_ai.usage.input_tokens", judge_response.usage.prompt_tokens)
+                span.set_attribute("gen_ai.usage.output_tokens", judge_response.usage.completion_tokens)
+
+            # Parse JSON response
+            result = json.loads(result_text)
+            score = float(result.get("score", 0.0))
+            reasoning = result.get("reasoning", "No reasoning provided")
+
+            # Clamp score between 0 and 1
+            score = max(0.0, min(1.0, score))
+
+            span.set_attribute("evaluation.score", score)
+            span.set_attribute("evaluation.reasoning", reasoning)
+
+            return score, reasoning
+
+        except Exception as e:
+            logging.error(f"Error in LLM evaluation for {criterion}: {str(e)}")
+            span.set_attribute("error", True)
+            span.set_attribute("error.message", str(e))
+            # Fallback to neutral score
+            return 0.5, f"Evaluation failed: {str(e)}"
+
+
+def evaluate_response(response_id: str, response_text: str, user_query: str,
+                       context: str = "", client=None, deployment_name: Optional[str] = None):
+    """
+    Run multiple LLM-as-a-judge evaluations on the AI response
+    """
+    if client is None or deployment_name is None:
+        logging.warning("No OpenAI client provided, skipping evaluations")
+        return
+
+    # Relevance evaluation using LLM judge
+    relevance_score, relevance_reasoning = evaluate_with_llm(
+        client, deployment_name, response_id, response_text, user_query, "relevance"
+    )
+    log_evaluation(response_id, "relevance", relevance_score, reasoning=relevance_reasoning)
+
+    # Coherence evaluation using LLM judge
+    coherence_score, coherence_reasoning = evaluate_with_llm(
+        client, deployment_name, response_id, response_text, user_query, "coherence"
+    )
+    log_evaluation(response_id, "coherence", coherence_score, reasoning=coherence_reasoning)
+
+    # Groundedness evaluation using LLM judge (with context)
+    groundedness_score, groundedness_reasoning = evaluate_with_llm(
+        client, deployment_name, response_id, response_text, user_query, "groundedness", context
+    )
+    log_evaluation(response_id, "groundedness", groundedness_score, reasoning=groundedness_reasoning)
+
+    # Helpfulness evaluation using LLM judge
+    helpfulness_score, helpfulness_reasoning = evaluate_with_llm(
+        client, deployment_name, response_id, response_text, user_query, "helpfulness"
+    )
+    log_evaluation(response_id, "helpfulness", helpfulness_score, reasoning=helpfulness_reasoning)
 
 
 def get_weather(location: str, unit: str = "celsius") -> dict:
@@ -172,6 +307,7 @@ def weather_chat(req: func.HttpRequest) -> func.HttpResponse:
 
             # Check if the model wants to call a tool
             tool_calls = response_message.tool_calls
+            weather_context = ""  # Track context for groundedness evaluation
 
             if tool_calls:
                 # Execute tool calls
@@ -186,13 +322,14 @@ def weather_chat(req: func.HttpRequest) -> func.HttpResponse:
                     # Call the weather function
                     if function_name == "get_weather":
                         function_response = get_weather(**function_args)
+                        weather_context = json.dumps(function_response)  # Capture for evaluation
 
                         # Add tool response to messages
                         messages.append({
                             "tool_call_id": tool_call.id,
                             "role": "tool",
                             "name": function_name,
-                            "content": json.dumps(function_response)
+                            "content": weather_context
                         })
 
                 # Second API call with tool results
@@ -221,13 +358,21 @@ def weather_chat(req: func.HttpRequest) -> func.HttpResponse:
                     logging.info(f"Final response: {final_message}")
             else:
                 # No tool call needed
-                final_message = response_message.content
+                final_message = response_message.content or ""
 
             span.set_attribute("response.success", True)
             span.set_attribute("response.length", len(final_message))
 
-            # Run evaluations on the response
-            evaluate_response(response_id, final_message, user_message)
+            # Run evaluations on the response with LLM-as-a-judge
+            if final_message:
+                evaluate_response(
+                    response_id=response_id,
+                    response_text=final_message,
+                    user_query=user_message,
+                    context=weather_context,
+                    client=client,
+                    deployment_name=deployment_name
+                )
 
             return func.HttpResponse(
                 json.dumps({
