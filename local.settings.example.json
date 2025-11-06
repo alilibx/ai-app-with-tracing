@@ -1,0 +1,13 @@
+{
+  "IsEncrypted": false,
+  "Values": {
+    "AzureWebJobsStorage": "UseDevelopmentStorage=true",
+    "FUNCTIONS_WORKER_RUNTIME": "python",
+    "APPLICATIONINSIGHTS_CONNECTION_STRING": "InstrumentationKey=<your-instrumentation-key>;IngestionEndpoint=<your-ingestion-endpoint>;LiveEndpoint=<your-live-endpoint>;ApplicationId=<your-application-id>",
+    "AZURE_OPENAI_ENDPOINT": "https://<your-resource-name>.openai.azure.com",
+    "AZURE_OPENAI_API_KEY": "<your-azure-openai-api-key>",
+    "AZURE_OPENAI_DEPLOYMENT_NAME": "<your-deployment-name>",
+    "AZURE_OPENAI_API_VERSION": "2024-02-15-preview",
+    "OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT": "true"
+  }
+}

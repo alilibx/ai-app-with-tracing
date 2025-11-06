@@ -1,0 +1,83 @@
+// ========================================================================
+// Comprehensive All-in-One Query for Azure Function Weather App Tracing
+// ========================================================================
+// Simplified version with minimal let statements for better KQL compatibility
+// Updated: Improved time range (7d) and more robust syntax
+
+// Get all root weather_chat_function spans with GenAI attributes
+dependencies
+| where timestamp > ago(7d)
+| where customDimensions has "gen_ai.system"
+| where name == "weather_chat_function"
+| project
+    root_operation_Id = operation_Id,
+    startTime = timestamp,
+    root_duration = duration,
+    success,
+    user_message = tostring(customDimensions["user.message"]),
+    response_id = tostring(customDimensions["gen_ai.response.id"])
+// Join with aggregated span details (tokens, execution flow)
+| join kind=leftouter (
+    dependencies
+    | where timestamp > ago(7d)
+    | where name in ("weather_chat_function", "openai_initial_request", "openai_final_request", "get_weather_api_call")
+    | extend
+        response_id = tostring(customDimensions["gen_ai.response.id"]),
+        input_tokens = toint(customDimensions["gen_ai.usage.input_tokens"]),
+        output_tokens = toint(customDimensions["gen_ai.usage.output_tokens"]),
+        total_tokens = toint(customDimensions["gen_ai.usage.total_tokens"]),
+        model = tostring(customDimensions["gen_ai.request.model"]),
+        finish_reason = tostring(customDimensions["gen_ai.response.finish_reason"]),
+        location = tostring(customDimensions["location"]),
+        temperature = tostring(customDimensions["weather.temperature"])
+    | summarize
+        execution_flow = make_list(name),
+        span_count = count(),
+        total_input_tokens = sum(input_tokens),
+        total_output_tokens = sum(output_tokens),
+        total_tokens = sum(total_tokens),
+        model = max(model),
+        location = max(location),
+        temperature = max(temperature),
+        finish_reasons = make_set(finish_reason),
+        span_durations = make_list(pack("span", name, "duration_ms", duration / 10000.0))
+        by operation_Id
+) on $left.root_operation_Id == $right.operation_Id
+// Join with evaluation scores
+| join kind=leftouter (
+    dependencies
+    | where timestamp > ago(7d)
+    | where name startswith "gen_ai.evaluation"
+    | extend
+        response_id = tostring(customDimensions["gen_ai.response.id"]),
+        evaluator_name = tostring(customDimensions["gen_ai.evaluator.name"]),
+        evaluation_score = todouble(customDimensions["gen_ai.evaluation.score"])
+    | where isnotempty(response_id) and isnotnull(evaluation_score)
+    | summarize
+        evaluations = make_bag(pack(evaluator_name, evaluation_score)),
+        avg_evaluation_score = avg(evaluation_score),
+        eval_count = count()
+        by response_id
+) on response_id
+| project
+    startTime,
+    operation_Id = root_operation_Id,
+    response_id,
+    user_message,
+    location,
+    temperature,
+    duration_ms = root_duration / 10000.0,
+    success,
+    span_count,
+    execution_flow,
+    input_tokens = total_input_tokens,
+    output_tokens = total_output_tokens,
+    total_tokens,
+    estimated_cost_usd = round((coalesce(total_input_tokens, 0) / 1000.0 * 0.03) + (coalesce(total_output_tokens, 0) / 1000.0 * 0.06), 4),
+    model,
+    finish_reasons,
+    evaluations,
+    avg_evaluation_score,
+    eval_count = coalesce(eval_count, 0),
+    span_durations
+| order by startTime desc;

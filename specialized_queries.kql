@@ -1,0 +1,229 @@
+// ========================================================================
+// Specialized KQL Queries for Azure Function Weather App Tracing
+// ========================================================================
+
+// ========================================================================
+// 1. ERROR ANALYSIS - Find and analyze failed requests
+// ========================================================================
+dependencies
+| where timestamp > ago(7d)
+| where name == "weather_chat_function"
+| where success == false or customDimensions has "error"
+| extend
+    user_message = tostring(customDimensions["user.message"]),
+    error_message = tostring(customDimensions["error.message"]),
+    error_type = tostring(customDimensions["error.type"]),
+    response_id = tostring(customDimensions["gen_ai.response.id"])
+| project
+    timestamp,
+    operation_Id,
+    response_id,
+    user_message,
+    duration_ms = duration / 10000.0,
+    success,
+    error_type,
+    error_message,
+    resultCode
+| order by timestamp desc;
+
+// ========================================================================
+// 2. COST ANALYSIS - Token usage and estimated costs over time
+// ========================================================================
+dependencies
+| where timestamp > ago(7d)
+| where name in ("openai_initial_request", "openai_final_request")
+| extend
+    input_tokens = toint(customDimensions["gen_ai.usage.input_tokens"]),
+    output_tokens = toint(customDimensions["gen_ai.usage.output_tokens"]),
+    total_tokens = toint(customDimensions["gen_ai.usage.total_tokens"]),
+    model = tostring(customDimensions["gen_ai.request.model"])
+| summarize
+    total_requests = count(),
+    total_input_tokens = sum(input_tokens),
+    total_output_tokens = sum(output_tokens),
+    total_tokens = sum(total_tokens),
+    avg_tokens_per_request = avg(total_tokens)
+    by bin(timestamp, 1h), model
+| extend
+    estimated_cost_usd = round((total_input_tokens / 1000.0 * 0.03) + (total_output_tokens / 1000.0 * 0.06), 4)
+| project
+    timestamp,
+    model,
+    total_requests,
+    total_input_tokens,
+    total_output_tokens,
+    total_tokens,
+    avg_tokens_per_request = round(avg_tokens_per_request, 2),
+    estimated_cost_usd
+| order by timestamp desc;
+
+// ========================================================================
+// 3. PERFORMANCE MONITORING - Request durations and latency analysis
+// ========================================================================
+dependencies
+| where timestamp > ago(7d)
+| where name == "weather_chat_function"
+| extend
+    user_message = tostring(customDimensions["user.message"]),
+    response_id = tostring(customDimensions["gen_ai.response.id"]),
+    duration_ms = duration / 10000.0
+| summarize
+    request_count = count(),
+    avg_duration_ms = round(avg(duration_ms), 2),
+    p50_duration_ms = round(percentile(duration_ms, 50), 2),
+    p95_duration_ms = round(percentile(duration_ms, 95), 2),
+    p99_duration_ms = round(percentile(duration_ms, 99), 2),
+    min_duration_ms = round(min(duration_ms), 2),
+    max_duration_ms = round(max(duration_ms), 2),
+    success_rate = round(100.0 * countif(success) / count(), 2)
+    by bin(timestamp, 1h)
+| order by timestamp desc;
+
+// ========================================================================
+// 4. DETAILED SPAN BREAKDOWN - Performance by span type
+// ========================================================================
+dependencies
+| where timestamp > ago(7d)
+| where name in ("weather_chat_function", "openai_initial_request", "openai_final_request", "get_weather_api_call")
+| extend duration_ms = duration / 10000.0
+| summarize
+    count = count(),
+    avg_duration_ms = round(avg(duration_ms), 2),
+    p95_duration_ms = round(percentile(duration_ms, 95), 2),
+    max_duration_ms = round(max(duration_ms), 2),
+    success_rate = round(100.0 * countif(success) / count(), 2)
+    by name
+| order by avg_duration_ms desc;
+
+// ========================================================================
+// 5. TOOL CALLS ANALYSIS - Track function calling patterns
+// ========================================================================
+dependencies
+| where timestamp > ago(7d)
+| where name in ("openai_initial_request", "openai_final_request")
+| extend
+    finish_reason = tostring(customDimensions["gen_ai.response.finish_reason"]),
+    model = tostring(customDimensions["gen_ai.request.model"])
+| summarize
+    total_calls = count(),
+    tool_calls_count = countif(finish_reason == "tool_calls"),
+    stop_count = countif(finish_reason == "stop"),
+    other_count = countif(finish_reason != "tool_calls" and finish_reason != "stop")
+    by model
+| extend
+    tool_calls_percentage = round(100.0 * tool_calls_count / total_calls, 2)
+| project
+    model,
+    total_calls,
+    tool_calls_count,
+    tool_calls_percentage,
+    stop_count,
+    other_count;
+
+// ========================================================================
+// 6. LOCATION USAGE ANALYSIS - Most requested weather locations
+// ========================================================================
+dependencies
+| where timestamp > ago(7d)
+| where name == "get_weather_api_call"
+| extend
+    location = tostring(customDimensions["location"]),
+    temperature = tostring(customDimensions["weather.temperature"])
+| where isnotempty(location)
+| summarize
+    request_count = count(),
+    avg_duration_ms = round(avg(duration / 10000.0), 2),
+    success_rate = round(100.0 * countif(success) / count(), 2),
+    sample_temperature = any(temperature)
+    by location
+| order by request_count desc;
+
+// ========================================================================
+// 7. REAL-TIME MONITORING - Last 1 hour activity
+// ========================================================================
+dependencies
+| where timestamp > ago(1h)
+| where name == "weather_chat_function"
+| extend
+    user_message = tostring(customDimensions["user.message"]),
+    response_id = tostring(customDimensions["gen_ai.response.id"]),
+    duration_ms = duration / 10000.0
+| project
+    timestamp,
+    operation_Id,
+    response_id,
+    user_message,
+    duration_ms,
+    success
+| order by timestamp desc;
+
+// ========================================================================
+// 8. EVALUATION SCORES ANALYSIS - Track AI response quality
+// ========================================================================
+dependencies
+| where timestamp > ago(7d)
+| where name startswith "gen_ai.evaluation"
+| extend
+    response_id = tostring(customDimensions["gen_ai.response.id"]),
+    evaluator_name = tostring(customDimensions["gen_ai.evaluator.name"]),
+    evaluation_score = todouble(customDimensions["gen_ai.evaluation.score"])
+| where isnotempty(response_id) and isnotnull(evaluation_score)
+| summarize
+    evaluation_count = count(),
+    avg_score = round(avg(evaluation_score), 3),
+    min_score = round(min(evaluation_score), 3),
+    max_score = round(max(evaluation_score), 3),
+    p50_score = round(percentile(evaluation_score, 50), 3),
+    p95_score = round(percentile(evaluation_score, 95), 3)
+    by evaluator_name
+| order by evaluator_name asc;
+
+// ========================================================================
+// 9. DAILY SUMMARY STATISTICS
+// ========================================================================
+dependencies
+| where timestamp > ago(30d)
+| where name == "weather_chat_function"
+| extend
+    input_tokens = toint(customDimensions["gen_ai.usage.input_tokens"]),
+    output_tokens = toint(customDimensions["gen_ai.usage.output_tokens"])
+| summarize
+    total_requests = count(),
+    successful_requests = countif(success),
+    failed_requests = countif(success == false),
+    avg_duration_ms = round(avg(duration / 10000.0), 2),
+    total_tokens_used = sum(input_tokens) + sum(output_tokens),
+    estimated_daily_cost = round(((sum(input_tokens) / 1000.0 * 0.03) + (sum(output_tokens) / 1000.0 * 0.06)), 4)
+    by bin(timestamp, 1d)
+| extend
+    success_rate = round(100.0 * successful_requests / total_requests, 2)
+| project
+    date = format_datetime(timestamp, 'yyyy-MM-dd'),
+    total_requests,
+    successful_requests,
+    failed_requests,
+    success_rate,
+    avg_duration_ms,
+    total_tokens_used,
+    estimated_daily_cost
+| order by date desc;
+
+// ========================================================================
+// 10. SLOW REQUESTS - Find requests slower than threshold (e.g., 3 seconds)
+// ========================================================================
+dependencies
+| where timestamp > ago(7d)
+| where name == "weather_chat_function"
+| extend duration_ms = duration / 10000.0
+| where duration_ms > 3000  // Threshold: 3 seconds
+| extend
+    user_message = tostring(customDimensions["user.message"]),
+    response_id = tostring(customDimensions["gen_ai.response.id"])
+| project
+    timestamp,
+    operation_Id,
+    response_id,
+    user_message,
+    duration_ms,
+    success
+| order by duration_ms desc;
